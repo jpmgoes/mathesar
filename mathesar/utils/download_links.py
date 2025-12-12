@@ -15,6 +15,9 @@ import fsspec
 from PIL import Image, UnidentifiedImageError
 import yaml
 
+import boto3
+from botocore.client import Config
+
 from db.records import list_records_from_table
 from db.columns import reset_mash
 
@@ -31,6 +34,29 @@ PUBLIC_FORM_ACCESS_KEY = "public_form_access"
 def maintain_download_links():
     DownloadLink.objects.filter(sessions__isnull=True).delete()
 
+# --- Add this Helper Function ---
+def _create_boto3_client(fsspec_kwargs):
+    from botocore.client import Config
+    import boto3
+    
+    kw = fsspec_kwargs
+    client_kw = kw.get('client_kwargs', {})
+    
+    # Force Path Style addressing
+    my_config = Config(
+        region_name=client_kw.get('region_name', 'us-east-1'),
+        signature_version='s3v4',
+        s3={'addressing_style': 'path'}
+    )
+    
+    return boto3.client(
+        's3',
+        aws_access_key_id=kw['key'],
+        aws_secret_access_key=kw['secret'],
+        endpoint_url=client_kw.get('endpoint_url'),
+        config=my_config
+    )
+# --------------------------------
 
 def get_link_contents(session_key, download_link_mash):
     link = get_object_or_404(
@@ -39,16 +65,34 @@ def get_link_contents(session_key, download_link_mash):
         sessions=session_key,
     )
     content_type = _mimetype(link.uri)
-    of = fsspec.open(link.uri, "rb", **link.fsspec_kwargs)
     filename = _get_filename_for_uri(link.uri)
 
+    # --- PATCH: Use Boto3 for S3 Downloads ---
+    if link.uri.startswith("s3://"):
+        def stream_file():
+            # Create client
+            s3 = _create_boto3_client(link.fsspec_kwargs)
+            
+            # Parse bucket and key from uri: s3://bucket/path/to/file
+            path_part = link.uri.split("://")[1]
+            bucket_name, object_key = path_part.split("/", 1)
+            
+            # Get object and stream chunks
+            response = s3.get_object(Bucket=bucket_name, Key=object_key)
+            for chunk in response['Body'].iter_chunks(chunk_size=4096):
+                yield chunk
+                
+        return stream_file, filename, content_type
+    # -----------------------------------------
+
+    # Fallback for local files
+    of = fsspec.open(link.uri, "rb", **link.fsspec_kwargs)
     def stream_file():
         with of as f:
             while scoop := f.read(512):
                 yield scoop
 
     return stream_file, filename, content_type
-
 
 def get_link_thumbnail(session_key, download_link_mash, width=500, height=500):
     link = get_object_or_404(
@@ -61,8 +105,26 @@ def get_link_thumbnail(session_key, download_link_mash, width=500, height=500):
     key = f"{size[0]}x{size[1]}"
 
     if (thumb_64 := link.thumbnail.get(key)) is None:
-        of = fsspec.open(link.uri, "rb", **link.fsspec_kwargs)
-        thumbnail = _build_thumbnail_bytes(of, size)
+        # --- PATCH: Use Boto3 for S3 Thumbnails ---
+        if link.uri.startswith("s3://"):
+            s3 = _create_boto3_client(link.fsspec_kwargs)
+            
+            # Parse bucket and key
+            path_part = link.uri.split("://")[1]
+            bucket_name, object_key = path_part.split("/", 1)
+            
+            # Download image into memory
+            response = s3.get_object(Bucket=bucket_name, Key=object_key)
+            file_data = io.BytesIO(response['Body'].read())
+            
+            # Generate thumbnail
+            thumbnail = _build_thumbnail_bytes(file_data, size)
+        # ------------------------------------------
+        else:
+            # Fallback for local files
+            of = fsspec.open(link.uri, "rb", **link.fsspec_kwargs)
+            thumbnail = _build_thumbnail_bytes(of, size)
+            
         link.thumbnail[key] = base64.b64encode(thumbnail).decode("utf-8")
         link.save()
     else:
@@ -164,11 +226,43 @@ def build_links_from_json(json_strs):
 def save_file(f, request, backend_key=DEFAULT_BACKEND_KEY):
     backend = get_backends()[backend_key]
     now = datetime.datetime.now().strftime('%Y%m%d-%H%M%S%f')
-    uri = f"{backend['protocol']}://{backend['prefix']}/{request.user}/{now}/{f.name}"
-    of = fsspec.open(uri, mode='xb', **backend["kwargs"])
-    with of as destination:
-        for chunk in f.chunks():
-            destination.write(chunk)
+    
+    # -------------
+    file_key = f"{request.user}/{now}/{f.name}"
+    uri = f"{backend['protocol']}://{backend['prefix']}/{file_key}"
+
+    if backend['protocol'] == 's3':
+        kw = backend['kwargs']
+        client_kw = kw.get('client_kwargs', {})
+        
+        my_config = Config(
+            region_name=client_kw.get('region_name', 'us-east-1'),
+            signature_version='s3v4',
+            s3={'addressing_style': 'path'}
+        )
+
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=kw['key'],
+            aws_secret_access_key=kw['secret'],
+            endpoint_url=client_kw.get('endpoint_url'),
+            config=my_config
+        )
+
+        bucket_name = backend['prefix']
+        
+        f.seek(0)
+        s3.upload_fileobj(f, bucket_name, file_key)
+        
+    else:
+        # --- Fallback for local files ---
+        # Note: We must use 'uri' here, not file_key
+        of = fsspec.open(uri, mode='xb', **backend["kwargs"])
+        with of as destination:
+            for chunk in f.chunks():
+                destination.write(chunk)
+
+    # -------------
 
     result = create_json_for_uri(uri, backend_key)
     link = sync_links_from_json_strings(request.session.session_key, [result])[0]
